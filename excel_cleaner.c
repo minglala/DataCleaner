@@ -53,36 +53,119 @@ static char* wchar_to_utf8_len(const wchar_t* wstr, int wlen) {
 // 数字提取与格式化
 // ============================================================
 
-static int extract_numbers(const char* text, double* nums, int max_nums) {
+// 读取 p 处的 UTF-8 字符，返回码点并通过 adv 返回字节数；非法字节按单字节原样处理
+static unsigned int utf8_decode_at(const char* p, int* adv) {
+    const unsigned char* s = (const unsigned char*)p;
+    if (s[0] < 0x80) { *adv = 1; return s[0]; }
+    if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *adv = 2;
+        return ((unsigned)(s[0] & 0x1F) << 6) | (unsigned)(s[1] & 0x3F);
+    }
+    if ((s[0] & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *adv = 3;
+        return ((unsigned)(s[0] & 0x0F) << 12) | ((unsigned)(s[1] & 0x3F) << 6) | (unsigned)(s[2] & 0x3F);
+    }
+    if ((s[0] & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+        *adv = 4;
+        return ((unsigned)(s[0] & 0x07) << 18) | ((unsigned)(s[1] & 0x3F) << 12) |
+               ((unsigned)(s[2] & 0x3F) << 6) | (unsigned)(s[3] & 0x3F);
+    }
+    *adv = 1;
+    return s[0];
+}
+
+// 数字识别前的文本规范化（返回 malloc 缓冲，调用方 free；失败返回 NULL）：
+// 1) 全角数字/小数点/逗号/负号转半角（０-９ ． ， － → 0-9 . , -），其余字符原样保留
+// 2) 去除千分位分隔符：逗号前一位为数字、其后恰好 3 位数字且再后一位不是数字时，
+//    视为分组逗号并删除（"1,234,567" → "1234567"；"3, 5"、"3,50" 中的逗号不合并）
+static char* normalize_number_text(const char* text) {
+    size_t n = strlen(text);
+    char* a = (char*)malloc(n + 1);
+    if (!a) return NULL;
+
+    size_t w = 0;
+    for (size_t i = 0; i < n; ) {
+        int adv = 1;
+        unsigned int cp = utf8_decode_at(text + i, &adv);
+        if (cp >= 0xFF10 && cp <= 0xFF19) a[w++] = (char)('0' + (int)(cp - 0xFF10));
+        else if (cp == 0xFF0E) a[w++] = '.';
+        else if (cp == 0xFF0C) a[w++] = ',';
+        else if (cp == 0xFF0D) a[w++] = '-';
+        else { memcpy(a + w, text + i, (size_t)adv); w += (size_t)adv; }
+        i += (size_t)adv;
+    }
+    a[w] = '\0';
+
+    char* b = (char*)malloc(w + 1);
+    if (!b) { free(a); return NULL; }
+    size_t m = 0;
+    for (size_t i = 0; i < w; i++) {
+        if (a[i] == ',' && m > 0 && isdigit((unsigned char)b[m - 1])
+            && i + 3 < w
+            && isdigit((unsigned char)a[i + 1]) && isdigit((unsigned char)a[i + 2]) && isdigit((unsigned char)a[i + 3])
+            && (i + 4 >= w || !isdigit((unsigned char)a[i + 4]))) {
+            continue; // 千分位分组逗号，跳过
+        }
+        b[m++] = a[i];
+    }
+    b[m] = '\0';
+    free(a);
+    return b;
+}
+
+// 提取数字；raws 非 NULL 时同时记录每个数字在规范化文本中的原始字面（供长整数原样输出）
+static int extract_numbers(const char* text, double* nums, char (*raws)[64], int max_nums) {
     if (!text || !*text) return 0;
+    char* norm = normalize_number_text(text);
+    const char* src = norm ? norm : text;
     int count = 0;
-    const char* p = text;
+    const char* p = src;
 
     while (*p && count < max_nums) {
+        const char* start = NULL;
         if (*p == '-' && (isdigit((unsigned char)*(p + 1)) || (*(p + 1) == '.' && isdigit((unsigned char)*(p + 2))))) {
-            char* endptr = NULL;
-            double val = strtod(p, &endptr);
-            if (endptr > p) {
-                nums[count++] = val;
-                p = endptr;
-                continue;
-            }
+            start = p;
         } else if (isdigit((unsigned char)*p) || (*p == '.' && isdigit((unsigned char)*(p + 1)))) {
+            start = p;
+        }
+        if (start) {
             char* endptr = NULL;
-            double val = strtod(p, &endptr);
-            if (endptr > p) {
-                nums[count++] = val;
+            double val = strtod(start, &endptr);
+            if (endptr > start) {
+                nums[count] = val;
+                if (raws) {
+                    size_t tl = (size_t)(endptr - start);
+                    if (tl > 63) tl = 63;
+                    memcpy(raws[count], start, tl);
+                    raws[count][tl] = '\0';
+                }
+                count++;
                 p = endptr;
                 continue;
             }
         }
         p++;
     }
+    free(norm);
     return count;
 }
 
+// 判断字面是否为纯整数（可选负号 + 数字）且位数 > 15（超出 double 可长期精确表示的范围）
+static int is_long_integer_token(const char* s) {
+    if (!s || !*s) return 0;
+    if (*s == '-') s++;
+    int digits = 0;
+    for (; *s; s++) {
+        if (!isdigit((unsigned char)*s)) return 0;
+        digits++;
+    }
+    return digits > 15;
+}
+
 static void format_double_clean(double val, char* buf, size_t buf_size) {
-    if (floor(val) == val && fabs(val) < 1e15) {
+    // 2^53 以内的整数可被 double 精确表示，直接输出整数形式，
+    // 避免 %.6g 把长整数写成科学计数法而丢失精度
+    if (floor(val) == val && fabs(val) < 9007199254740992.0) {
         snprintf(buf, buf_size, "%.0f", val);
     } else {
         snprintf(buf, buf_size, "%.6g", val);
@@ -323,7 +406,8 @@ static void clean_cell_value_c(const char* in, const CleanOptions* opts, char* o
     }
 
     double nums[MAX_NUMS_PER_CELL];
-    int count = extract_numbers(in, nums, MAX_NUMS_PER_CELL);
+    char raws[MAX_NUMS_PER_CELL][64];
+    int count = extract_numbers(in, nums, raws, MAX_NUMS_PER_CELL);
     *nums_found = count;
 
     if (count == 0) {
@@ -348,9 +432,16 @@ static void clean_cell_value_c(const char* in, const CleanOptions* opts, char* o
         out[0] = '\0';
         size_t olen = 0;
         for (int i = 0; i < count; i++) {
-            format_double_clean(nums[i], temp, sizeof(temp));
+            // 超过 15 位的纯整数超出 double 精确表示范围，原样输出字面，避免长 ID 丢精度
+            const char* piece;
+            if (is_long_integer_token(raws[i])) {
+                piece = raws[i];
+            } else {
+                format_double_clean(nums[i], temp, sizeof(temp));
+                piece = temp;
+            }
             if (i > 0) strncat(out, sep, out_max - strlen(out) - 1);
-            strncat(out, temp, out_max - strlen(out) - 1);
+            strncat(out, piece, out_max - strlen(out) - 1);
             olen = strlen(out);
         }
         (void)olen;
