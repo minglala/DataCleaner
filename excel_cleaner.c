@@ -1948,6 +1948,7 @@ static int process_csv(const wchar_t* in_path, const wchar_t* out_path,
         // 处理分隔符 / 行结束
         char ch = content[i];
         if (ch == ',') {
+            fputc(',', out); // 写出字段分隔符（原实现只消费不写出，导出会丢列）
             i++;
         } else {
             if (row_fields > 0) fputc('\n', out);
