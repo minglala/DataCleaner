@@ -938,17 +938,30 @@ static int process_csv(const wchar_t* in_path, const wchar_t* out_path,
 // ============================================================
 
 static void make_output_path(const wchar_t* in, wchar_t* out) {
-    wcscpy(out, in);
-    wchar_t* dot = wcsrchr(out, L'.');
-    if (dot && dot != out) {
-        wchar_t ext[32];
-        wcsncpy(ext, dot, 31);
-        ext[31] = L'\0';
-        wcscpy(dot, L"_Cleaned");
-        wcscat(out, ext);
-    } else {
-        wcscat(out, L"_Cleaned");
+    // out 固定为 DC_PATH 长度：先算总长，超长时截断文件名主体，保证 "_Cleaned" 与扩展名完整，
+    // 不再无检查地 wcscat（输入路径接近上限时会写越界）
+    const size_t cap = DC_PATH - 1;
+    const wchar_t suffix[] = L"_Cleaned";
+    const size_t suf_len = wcslen(suffix);
+    size_t in_len = wcslen(in);
+    const wchar_t* dot = wcsrchr(in, L'.');
+    size_t base_len = (dot && dot != in) ? (size_t)(dot - in) : in_len;
+    const wchar_t* ext = (dot && dot != in) ? dot : L"";
+    size_t ext_len = wcslen(ext);
+
+    if (base_len + suf_len + ext_len > cap) {
+        size_t room = (cap > suf_len + ext_len) ? (cap - suf_len - ext_len) : 0;
+        if (base_len > room) base_len = room;
     }
+
+    size_t p = 0;
+    memcpy(out, in, base_len * sizeof(wchar_t));
+    p += base_len;
+    memcpy(out + p, suffix, suf_len * sizeof(wchar_t));
+    p += suf_len;
+    memcpy(out + p, ext, ext_len * sizeof(wchar_t));
+    p += ext_len;
+    out[p] = L'\0';
 }
 
 int run_clean_jobs(FileJob* jobs, int job_count, const CleanOptions* opts,
