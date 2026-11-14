@@ -42,6 +42,7 @@ typedef struct {
     long long kept_cells;        // 保持原样的单元格数
     long long numbers_found;     // 提取到的数字个数
     long long dates_normalized;  // 标准化的日期个数
+    long long formula_cells;     // 原样保留（未清洗）的公式单元格数（仅 xlsx 原位模式）
 } CleanStats;
 
 // 进度回调：user 为透传上下文
@@ -52,6 +53,7 @@ typedef struct {
     wchar_t input[DC_PATH];
     wchar_t output[DC_PATH];
     int result;        // 0 成功 / 1 失败 / 2 已取消 / 3 已跳过
+    int degraded;      // 1 = xlsx 原位模式不支持，已用兼容模式重建（样式/公式/合并单元格丢失）
     CleanStats stats;
 } FileJob;
 

@@ -91,6 +91,12 @@ static wchar_t g_szLastOutput[DC_PATH] = {0};
 static wchar_t g_szLastDir[DC_PATH]    = {0};
 static BOOL    g_bIsProcessing         = FALSE;
 
+// 工作线程生命周期：句柄保留到线程真正结束；关闭窗口时先取消、等线程收尾再销毁
+#define WM_APP_BATCH_DONE (WM_APP + 1)
+static HWND    g_hMainWnd        = NULL;
+static HANDLE  g_hWorker         = NULL;
+static BOOL    g_bCloseRequested = FALSE;
+
 // ---------------- 日志 ----------------
 static void AppendLog(const wchar_t* text) {
     if (!g_hEditLog) return;
@@ -315,7 +321,7 @@ typedef struct {
 
 static void SetProcessingUI(BOOL processing) {
     g_bIsProcessing = processing;
-    if (processing) g_cancel_requested = 0;
+    if (processing) InterlockedExchange(&g_cancel_requested, 0);
 
     EnableWindow(g_hBtnAddFiles, !processing);
     EnableWindow(g_hBtnAddFolder, !processing);
@@ -336,6 +342,13 @@ static void SetProcessingUI(BOOL processing) {
     }
 }
 
+// 批次结果：由工作线程填好后 PostMessage 交给 UI 线程（UI 线程负责释放）
+typedef struct {
+    int ok, fail, cancel, skip, degraded, count;
+    CleanStats total;
+    wchar_t lastOut[DC_PATH];
+} BatchResult;
+
 DWORD WINAPI WorkerThread(LPVOID lpParam) {
     BatchParams* bp = (BatchParams*)lpParam;
 
@@ -347,16 +360,21 @@ DWORD WINAPI WorkerThread(LPVOID lpParam) {
         AppendLog(line);
     }
 
+    BatchResult* r = (BatchResult*)calloc(1, sizeof(BatchResult));
     CleanStats total;
     memset(&total, 0, sizeof(total));
     run_clean_jobs(bp->jobs, bp->count, &bp->opts, ProgressCallbackFunc, NULL, &total);
 
     // 汇总结果
-    int ok = 0, fail = 0, cancel = 0, skip = 0;
+    int ok = 0, fail = 0, cancel = 0, skip = 0, degraded = 0;
     wchar_t lastOut[DC_PATH] = L"";
     for (int i = 0; i < bp->count; i++) {
         switch (bp->jobs[i].result) {
-        case 0: ok++; wcscpy(lastOut, bp->jobs[i].output); break;
+        case 0:
+            ok++;
+            if (bp->jobs[i].degraded) degraded++;
+            wcscpy(lastOut, bp->jobs[i].output);
+            break;
         case 1: fail++; break;
         case 2: cancel++; break;
         default: skip++; break;
@@ -366,56 +384,138 @@ DWORD WINAPI WorkerThread(LPVOID lpParam) {
     AppendLog(L"========================================");
     swprintf(line, 256, L"🎉 任务结束！成功 %d 个，失败 %d 个，取消 %d 个，跳过 %d 个", ok, fail, cancel, skip);
     AppendLog(line);
+    if (degraded > 0) {
+        swprintf(line, 256, L"⚠ 其中 %d 个 xlsx 以兼容模式重建：样式、公式、合并单元格已丢失（原因见上方日志）", degraded);
+        AppendLog(line);
+    }
 
     swprintf(line, 256, L"累计统计：处理单元格 %lld | 修改 %lld | 保留 %lld",
              total.total_cells, total.modified_cells, total.kept_cells);
     AppendLog(line);
-    swprintf(line, 256, L"累计统计：提取数字 %lld 个 | 标准化日期 %lld 个",
-             total.numbers_found, total.dates_normalized);
+    swprintf(line, 256, L"累计统计：提取数字 %lld 个 | 标准化日期 %lld 个 | 原样保留公式单元格 %lld 个",
+             total.numbers_found, total.dates_normalized, total.formula_cells);
     AppendLog(line);
 
     if (lastOut[0]) {
-        wcscpy(g_szLastOutput, lastOut);
         wchar_t msg[DC_PATH + 64];
         swprintf(msg, DC_PATH + 64, L"最后一个输出文件：%s", lastOut);
         AppendLog(msg);
-    } else {
-        g_szLastOutput[0] = L'\0';
     }
 
-    // 恢复 UI 状态
-    g_cancel_requested = 0;
-    SetProcessingUI(FALSE);
-    EnableWindow(g_hBtnOpenFolder, lastOut[0] ? TRUE : FALSE);
-    EnableWindow(g_hBtnOpenFile, lastOut[0] ? TRUE : FALSE);
-    SendMessageW(g_hProgressBar, PBM_SETPOS, ok + fail + cancel + skip == bp->count && bp->count > 0 ? 100 : 0, 0);
-
-    // 结果弹窗
-    wchar_t summary[512];
-    if (fail == 0 && cancel == 0 && skip == 0) {
-        swprintf(summary, 512,
-                 L"数据清洗完成！\n\n成功处理 %d 个文件\n修改单元格 %lld 个（共 %lld 个）\n提取数字 %lld 个，标准化日期 %lld 个",
-                 ok, total.modified_cells, total.total_cells, total.numbers_found, total.dates_normalized);
-        MessageBoxW(NULL, summary, L"成功", MB_OK | MB_ICONINFORMATION);
-    } else {
-        swprintf(summary, 512,
-                 L"任务结束。\n\n成功：%d，失败：%d，取消：%d，跳过：%d\n修改单元格 %lld 个（共 %lld 个）\n详情请查看主界面日志。",
-                 ok, fail, cancel, skip, total.modified_cells, total.total_cells);
-        MessageBoxW(NULL, summary, L"完成（有异常）", MB_OK | MB_ICONWARNING);
+    if (r) {
+        r->ok = ok; r->fail = fail; r->cancel = cancel; r->skip = skip;
+        r->degraded = degraded; r->count = bp->count; r->total = total;
+        wcscpy(r->lastOut, lastOut);
     }
 
     free(bp->jobs);
     free(bp);
+
+    // 最后一步：通知 UI 线程收尾（恢复界面 / 弹窗 / 关窗）。此后本线程不再触碰任何 UI。
+    // r 为 NULL（内存不足）时 UI 线程按"无结果"收尾。
+    if (!PostMessageW(g_hMainWnd, WM_APP_BATCH_DONE, 0, (LPARAM)r)) free(r);
     return 0;
+}
+
+// UI 线程：批次结束收尾
+static void OnBatchDone(HWND hwnd, BatchResult* r) {
+    if (g_hWorker) {
+        // 线程已发出最后一条消息，只剩 return；有限等待以防万一
+        WaitForSingleObject(g_hWorker, 5000);
+        CloseHandle(g_hWorker);
+        g_hWorker = NULL;
+    }
+
+    InterlockedExchange(&g_cancel_requested, 0);
+    SetProcessingUI(FALSE);
+
+    if (g_bCloseRequested) {
+        free(r);
+        DestroyWindow(hwnd);
+        return;
+    }
+
+    BOOL hasOut = (r && r->lastOut[0]);
+    if (hasOut) wcscpy(g_szLastOutput, r->lastOut);
+    else g_szLastOutput[0] = L'\0';
+    EnableWindow(g_hBtnOpenFolder, hasOut);
+    EnableWindow(g_hBtnOpenFile, hasOut);
+
+    if (!r) {
+        SendMessageW(g_hProgressBar, PBM_SETPOS, 0, 0);
+        MessageBoxW(hwnd, L"任务已结束，但汇总信息分配失败，详情请查看主界面日志。", L"完成", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    SendMessageW(g_hProgressBar, PBM_SETPOS,
+                 r->ok + r->fail + r->cancel + r->skip == r->count && r->count > 0 ? 100 : 0, 0);
+
+    // 结果弹窗（以主窗口为属主：弹窗期间无法再次启动任务）
+    wchar_t summary[768];
+    wchar_t degraded_note[160] = L"";
+    if (r->degraded > 0) {
+        swprintf(degraded_note, 160, L"\n\n⚠ %d 个 xlsx 以兼容模式重建，样式/公式/合并单元格已丢失。", r->degraded);
+    }
+    if (r->fail == 0 && r->cancel == 0 && r->skip == 0) {
+        swprintf(summary, 768,
+                 L"数据清洗完成！\n\n成功处理 %d 个文件\n修改单元格 %lld 个（共 %lld 个）\n提取数字 %lld 个，标准化日期 %lld 个%ls",
+                 r->ok, r->total.modified_cells, r->total.total_cells, r->total.numbers_found,
+                 r->total.dates_normalized, degraded_note);
+        MessageBoxW(hwnd, summary, L"成功", MB_OK | (r->degraded ? MB_ICONWARNING : MB_ICONINFORMATION));
+    } else {
+        swprintf(summary, 768,
+                 L"任务结束。\n\n成功：%d，失败：%d，取消：%d，跳过：%d\n修改单元格 %lld 个（共 %lld 个）%ls\n\n详情请查看主界面日志。",
+                 r->ok, r->fail, r->cancel, r->skip, r->total.modified_cells, r->total.total_cells, degraded_note);
+        MessageBoxW(hwnd, summary, L"完成（有异常）", MB_OK | MB_ICONWARNING);
+    }
+    free(r);
+}
+
+// 关闭窗口：处理中则先确认、请求取消，待工作线程收尾后再销毁窗口
+static void SaveConfig(void);
+static void OnCloseRequest(HWND hwnd) {
+    if (!g_bIsProcessing) {
+        DestroyWindow(hwnd);
+        return;
+    }
+
+    if (g_bCloseRequested) {
+        // 已在等待取消：允许强制退出。输出采用临时文件 + 原子替换，
+        // 强退最多残留 .dctmp 临时文件，不会产生截断的 _Cleaned 结果文件
+        if (MessageBoxW(hwnd,
+                        L"正在等待当前文件停止处理（大文件可能需要一些时间）。\n\n"
+                        L"是否立即强制退出？\n未完成文件的临时文件（*.dctmp）可能残留，已完成的结果不受影响。",
+                        L"强制退出", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+            SaveConfig();
+            ExitProcess(0);
+        }
+        return;
+    }
+
+    int ans = MessageBoxW(hwnd,
+                          L"数据清洗正在进行中，确定要取消任务并退出吗？\n\n"
+                          L"当前文件未完成的输出将被丢弃，已完成的文件不受影响。",
+                          L"确认退出", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+    if (ans != IDYES) return;
+
+    if (!g_bIsProcessing) { // 确认框期间任务恰好结束
+        DestroyWindow(hwnd);
+        return;
+    }
+    g_bCloseRequested = TRUE;
+    InterlockedExchange(&g_cancel_requested, 1);
+    EnableWindow(g_hBtnStart, FALSE);
+    AppendLog(L"⏹ 正在取消任务，当前文件停止后将自动退出...");
 }
 
 // ---------------- 开始 / 取消 ----------------
 static void OnStartCleaning(HWND hwnd) {
     if (g_bIsProcessing) {
-        g_cancel_requested = 1;
+        InterlockedExchange(&g_cancel_requested, 1);
         AppendLog(L"⏹ 已请求取消，正在停止当前任务...");
         return;
     }
+    if (g_hWorker) return; // 上一个线程尚未收尾完毕
 
     int fileCount = (int)SendMessageW(g_hListBox, LB_GETCOUNT, 0, 0);
     if (fileCount <= 0) {
@@ -464,7 +564,7 @@ static void OnStartCleaning(HWND hwnd) {
 
     HANDLE hThread = CreateThread(NULL, 0, WorkerThread, bp, 0, NULL);
     if (hThread) {
-        CloseHandle(hThread);
+        g_hWorker = hThread; // 保留句柄：收尾 / 关窗时据此确认线程已结束
     } else {
         free(bp->jobs);
         free(bp);
@@ -636,6 +736,7 @@ static void LayoutControls(HWND hwnd) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
+        g_hMainWnd = hwnd;
         // 字体
         g_hFontTitle = CreateFontW(-18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -805,6 +906,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     }
+    case WM_APP_BATCH_DONE:
+        OnBatchDone(hwnd, (BatchResult*)lParam);
+        return 0;
+    case WM_CLOSE:
+        OnCloseRequest(hwnd);
+        return 0;
     case WM_DESTROY:
         SaveConfig();
         if (g_hFontTitle) DeleteObject(g_hFontTitle);

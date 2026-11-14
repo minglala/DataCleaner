@@ -11,7 +11,6 @@
 
 #define MAX_NUMS_PER_CELL 128
 #define MAX_CELL_STR_LEN  4096
-#define MAX_SHEETS        64
 
 // 取消标志定义（UI 线程设置）
 volatile long g_cancel_requested = 0;
@@ -574,19 +573,31 @@ static int process_xlsx_rebuild(const wchar_t* in_path, const wchar_t* out_path,
 
     CellContext ctx = { opts, stats };
 
-    char* sheets[MAX_SHEETS];
+    // 工作表名动态收集：不再有固定上限，避免超出上限时静默丢表
+    char** sheets = NULL;
     int sheet_count = 0;
+    int sheet_cap = 0;
     int cancelled = 0;
+    int failed = 0;
 
     xlsxioreadersheetlist sheetlist = xlsxioread_sheetlist_open(read_handle);
     const char* name = NULL;
-    while (sheetlist && (name = xlsxioread_sheetlist_next(sheetlist)) != NULL && sheet_count < MAX_SHEETS) {
+    while (sheetlist && (name = xlsxioread_sheetlist_next(sheetlist)) != NULL) {
+        if (sheet_count == sheet_cap) {
+            int nc = sheet_cap ? sheet_cap * 2 : 16;
+            char** ns = (char**)realloc(sheets, sizeof(char*) * (size_t)nc);
+            if (!ns) { failed = 1; break; }
+            sheets = ns;
+            sheet_cap = nc;
+        }
         sheets[sheet_count] = strdup(name);
+        if (!sheets[sheet_count]) { failed = 1; break; }
         sheet_count++;
     }
     if (sheetlist) xlsxioread_sheetlist_close(sheetlist);
+    if (failed && cb) cb(user, 0, L"错误：内存不足，无法读取工作表列表！");
 
-    for (int i = 0; i < sheet_count && !cancelled; i++) {
+    for (int i = 0; i < sheet_count && !cancelled && !failed; i++) {
         if (g_cancel_requested) { cancelled = 1; break; }
 
         wchar_t status_buf[256];
@@ -595,6 +606,11 @@ static int process_xlsx_rebuild(const wchar_t* in_path, const wchar_t* out_path,
         if (cb) cb(user, pct, status_buf);
 
         lxw_worksheet* out_ws = workbook_add_worksheet(write_handle, sheets[i]);
+        if (!out_ws) {
+            if (cb) cb(user, 0, L"错误：无法在输出文件中创建工作表（表名非法或重复）！");
+            failed = 1;
+            break;
+        }
         xlsxioreadersheet read_sheet = xlsxioread_sheet_open(read_handle, sheets[i], XLSXIOREAD_SKIP_NONE);
 
         if (read_sheet) {
@@ -625,11 +641,12 @@ static int process_xlsx_rebuild(const wchar_t* in_path, const wchar_t* out_path,
     }
 
     for (int i = 0; i < sheet_count; i++) free(sheets[i]);
+    free(sheets);
 
     if (cb) cb(user, 95, L"正在保存并关闭 Excel 文件...");
 
     xlsxioread_close(read_handle);
-    workbook_close(write_handle);
+    lxw_error close_err = workbook_close(write_handle);
 
     free(in_utf8);
     free(out_utf8);
@@ -638,6 +655,13 @@ static int process_xlsx_rebuild(const wchar_t* in_path, const wchar_t* out_path,
         DeleteFileW(out_path);
         if (cb) cb(user, 0, L"任务已取消，已丢弃该文件的部分输出。");
         return 2;
+    }
+
+    // 写出失败（磁盘满 / 无权限等）必须报失败，不能当作成功
+    if (failed || close_err != LXW_NO_ERROR) {
+        DeleteFileW(out_path);
+        if (!failed && cb) cb(user, 0, L"错误：写出输出 Excel 文件失败（磁盘空间不足或无写入权限？）");
+        return 1;
     }
 
     if (cb) cb(user, 100, L"文件处理完成。");
@@ -742,15 +766,16 @@ static void dc_zip_free(DcZip* z) {
     memset(z, 0, sizeof(*z));
 }
 
-// 0 成功 / DC_ZIP_UNSUPPORTED 结构不支持 / 1 读取失败
-static int dc_zip_load(const wchar_t* path, DcZip* z) {
+// 0 成功 / DC_ZIP_UNSUPPORTED 结构不支持（*why 给出原因，可为 NULL）/ 1 读取失败
+#define DC_UNSUP(msg) do { if (why) *why = (msg); dc_zip_free(z); return DC_ZIP_UNSUPPORTED; } while (0)
+static int dc_zip_load(const wchar_t* path, DcZip* z, const wchar_t** why) {
     memset(z, 0, sizeof(*z));
     FILE* f = _wfopen(path, L"rb");
     if (!f) return 1;
     if (dc_seek_end(f) != 0) { fclose(f); return 1; }
     long long fsz = (long long)dc_tell(f);
     if (fsz <= 0) { fclose(f); return 1; }
-    if (fsz > DC_XLSX_MAX_FILE) { fclose(f); return DC_ZIP_UNSUPPORTED; }
+    if (fsz > DC_XLSX_MAX_FILE) { fclose(f); DC_UNSUP(L"文件超过 512MB"); }
     rewind(f);
     z->file = (unsigned char*)malloc((size_t)fsz);
     if (!z->file) { fclose(f); return 1; }
@@ -759,7 +784,7 @@ static int dc_zip_load(const wchar_t* path, DcZip* z) {
     z->file_len = (size_t)fsz;
 
     // 定位 EOCD（末尾 22 字节 + 最长 64KB 注释）
-    if (z->file_len < 22) { free(z->file); z->file = NULL; return DC_ZIP_UNSUPPORTED; }
+    if (z->file_len < 22) DC_UNSUP(L"不是有效的 xlsx（zip）文件");
     size_t back = z->file_len - 22;
     size_t minpos = (z->file_len > 65557) ? (z->file_len - 65557) : 0;
     const unsigned char* eocd = NULL;
@@ -770,24 +795,24 @@ static int dc_zip_load(const wchar_t* path, DcZip* z) {
         }
         if (i == minpos) break;
     }
-    if (!eocd) { free(z->file); z->file = NULL; return DC_ZIP_UNSUPPORTED; }
-    if (dc_rd16(eocd + 4) != 0 || dc_rd16(eocd + 6) != 0) { free(z->file); z->file = NULL; return DC_ZIP_UNSUPPORTED; } // 多磁盘
+    if (!eocd) DC_UNSUP(L"不是有效的 xlsx（zip）文件");
+    if (dc_rd16(eocd + 4) != 0 || dc_rd16(eocd + 6) != 0) DC_UNSUP(L"分卷 zip"); // 多磁盘
     int total = dc_rd16(eocd + 10);
     uint32_t cd_size = dc_rd32(eocd + 12);
     uint32_t cd_off = dc_rd32(eocd + 16);
-    if (total == 0xFFFF || cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu) { free(z->file); z->file = NULL; return DC_ZIP_UNSUPPORTED; } // zip64
+    if (total == 0xFFFF || cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu) DC_UNSUP(L"zip64 格式");
     z->comment = eocd + 22;
     z->comment_len = dc_rd16(eocd + 20);
-    if ((size_t)cd_off + cd_size > z->file_len) { free(z->file); z->file = NULL; return DC_ZIP_UNSUPPORTED; }
+    if ((size_t)cd_off + cd_size > z->file_len) DC_UNSUP(L"zip 目录损坏");
 
     z->e = (DcZipEntry*)calloc((size_t)(total > 0 ? total : 1), sizeof(DcZipEntry));
-    if (!z->e) return 1;
+    if (!z->e) { dc_zip_free(z); return 1; } // 释放整文件缓冲，避免泄漏
     z->n = total;
 
     const unsigned char* p = z->file + cd_off;
     const unsigned char* cd_end = p + cd_size;
     for (int i = 0; i < total; i++) {
-        if ((size_t)(cd_end - p) < 46 || dc_rd32(p) != 0x02014b50) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+        if ((size_t)(cd_end - p) < 46 || dc_rd32(p) != 0x02014b50) DC_UNSUP(L"zip 目录损坏");
         DcZipEntry* e = &z->e[i];
         e->flags = dc_rd16(p + 8);
         e->method = dc_rd16(p + 10);
@@ -801,10 +826,9 @@ static int dc_zip_load(const wchar_t* path, DcZip* z) {
         uint16_t cl = dc_rd16(p + 32);
         e->local_off = dc_rd32(p + 42);
         if (e->crc == 0xFFFFFFFFu || e->comp_size == 0xFFFFFFFFu || e->size == 0xFFFFFFFFu || e->local_off == 0xFFFFFFFFu) {
-            dc_zip_free(z);
-            return DC_ZIP_UNSUPPORTED; // zip64
+            DC_UNSUP(L"zip64 格式");
         }
-        if ((size_t)(cd_end - p) < (size_t)46 + nl + xl + cl) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+        if ((size_t)(cd_end - p) < (size_t)46 + nl + xl + cl) DC_UNSUP(L"zip 目录损坏");
         e->name = (char*)malloc((size_t)nl + 1);
         if (!e->name) { dc_zip_free(z); return 1; }
         memcpy(e->name, p + 46, nl);
@@ -813,16 +837,16 @@ static int dc_zip_load(const wchar_t* path, DcZip* z) {
         e->cd_len = (size_t)46 + nl + xl + cl;
         p += e->cd_len;
 
-        if (e->flags & 0x0001) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; } // 加密
+        if (e->flags & 0x0001) DC_UNSUP(L"文件已加密"); // 加密
 
         // 解析本地头，定位压缩数据
-        if ((size_t)e->local_off + 30 > z->file_len) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+        if ((size_t)e->local_off + 30 > z->file_len) DC_UNSUP(L"zip 条目损坏");
         const unsigned char* lh = z->file + e->local_off;
-        if (dc_rd32(lh) != 0x04034b50) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+        if (dc_rd32(lh) != 0x04034b50) DC_UNSUP(L"zip 条目损坏");
         uint16_t lnl = dc_rd16(lh + 26);
         uint16_t lxl = dc_rd16(lh + 28);
         const unsigned char* data = lh + 30 + lnl + lxl;
-        if ((size_t)(data - z->file) + e->comp_size > z->file_len) { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+        if ((size_t)(data - z->file) + e->comp_size > z->file_len) DC_UNSUP(L"zip 条目损坏");
         e->comp = data;
         e->raw = lh;
         size_t raw_len = (size_t)(data - lh) + e->comp_size;
@@ -831,12 +855,13 @@ static int dc_zip_load(const wchar_t* path, DcZip* z) {
             size_t remain = (size_t)(z->file + z->file_len - after);
             if (remain >= 4 && dc_rd32(after) == 0x08074b50) raw_len += 16;
             else if (remain >= 12 && dc_rd32(after) == e->crc && dc_rd32(after + 4) == e->comp_size && dc_rd32(after + 8) == e->size) raw_len += 12;
-            else { dc_zip_free(z); return DC_ZIP_UNSUPPORTED; }
+            else DC_UNSUP(L"zip 数据描述符无法识别");
         }
         e->raw_len = raw_len;
     }
     return 0;
 }
+#undef DC_UNSUP
 
 static DcZipEntry* dc_zip_find(DcZip* z, const char* name) {
     for (int i = 0; i < z->n; i++) {
@@ -1239,10 +1264,16 @@ static void dc_normalize_part_path(const char* target, char* out, size_t out_siz
     out[out_size - 1] = '\0';
 }
 
+typedef struct { char id[64]; char target[256]; } DcRelMap;
+
+static void dc_free_paths(char (*paths)[256]) { free(paths); }
+
 // 从 workbook.xml + rels 解析工作表部件路径（按工作簿顺序）
-// 0 成功 / DC_ZIP_UNSUPPORTED 不支持
-static int dc_parse_sheets(DcZip* z, char (*paths)[256], int max_sheets, int* out_count) {
+// 0 成功（*out_paths 为 malloc 的数组，调用方 dc_free_paths）/ DC_ZIP_UNSUPPORTED 不支持
+// 工作表数量不设上限，绝不静默截断。
+static int dc_parse_sheets(DcZip* z, char (**out_paths)[256], int* out_count) {
     *out_count = 0;
+    *out_paths = NULL;
     DcZipEntry* wb_e = dc_zip_find(z, "xl/workbook.xml");
     DcZipEntry* rel_e = dc_zip_find(z, "xl/_rels/workbook.xml.rels");
     if (!wb_e || !rel_e) return DC_ZIP_UNSUPPORTED;
@@ -1251,11 +1282,12 @@ static int dc_parse_sheets(DcZip* z, char (*paths)[256], int max_sheets, int* ou
     if (!wb || !rel) { free(wb); free(rel); return DC_ZIP_UNSUPPORTED; }
 
     int rc = DC_ZIP_UNSUPPORTED;
+    DcRelMap* maps = NULL;
+    int map_count = 0, map_cap = 0;
+    char (*paths)[256] = NULL;
+    int count = 0, path_cap = 0;
 
     // 收集 worksheet 关系：rId -> Target
-    typedef struct { char id[64]; char target[256]; } RelMap;
-    RelMap maps[256];
-    int map_count = 0;
     {
         const char* end = (const char*)rel + strlen((const char*)rel);
         const char* p = (const char*)rel;
@@ -1273,21 +1305,23 @@ static int dc_parse_sheets(DcZip* z, char (*paths)[256], int max_sheets, int* ou
             const DcAttr* a_type = dc_attr_find(attrs, na, "Type");
             const DcAttr* a_tg = dc_attr_find(attrs, na, "Target");
             if (a_id && a_type && a_tg) {
-                const char* tv = a_type->vs;
                 size_t tl = (size_t)(a_type->ve - a_type->vs);
                 if (tl >= 10 && strncmp(a_type->ve - 10, "/worksheet", 10) == 0) {
-                    if (map_count < 256) {
-                        RelMap* m = &maps[map_count++];
-                        size_t il = (size_t)(a_id->ve - a_id->vs);
-                        if (il > 63) il = 63;
-                        memcpy(m->id, a_id->vs, il);
-                        m->id[il] = '\0';
-                        size_t gl = (size_t)(a_tg->ve - a_tg->vs);
-                        if (gl > 255) gl = 255;
-                        memcpy(m->target, a_tg->vs, gl);
-                        m->target[gl] = '\0';
-                        (void)tv;
+                    size_t il = (size_t)(a_id->ve - a_id->vs);
+                    size_t gl = (size_t)(a_tg->ve - a_tg->vs);
+                    if (il > 63 || gl > 255) goto done; // 截断会导致错配，按不支持处理
+                    if (map_count == map_cap) {
+                        int nc = map_cap ? map_cap * 2 : 64;
+                        DcRelMap* nm = (DcRelMap*)realloc(maps, sizeof(DcRelMap) * (size_t)nc);
+                        if (!nm) goto done;
+                        maps = nm;
+                        map_cap = nc;
                     }
+                    DcRelMap* m = &maps[map_count++];
+                    memcpy(m->id, a_id->vs, il);
+                    m->id[il] = '\0';
+                    memcpy(m->target, a_tg->vs, gl);
+                    m->target[gl] = '\0';
                 }
             }
             p = te;
@@ -1298,7 +1332,6 @@ static int dc_parse_sheets(DcZip* z, char (*paths)[256], int max_sheets, int* ou
     {
         const char* end = (const char*)wb + strlen((const char*)wb);
         const char* p = (const char*)wb;
-        int count = 0;
         while (p < end) {
             const char* tag = strstr(p, "<sheet");
             if (!tag || tag >= end) break;
@@ -1321,18 +1354,28 @@ static int dc_parse_sheets(DcZip* z, char (*paths)[256], int max_sheets, int* ou
                 if (strcmp(maps[i].id, rid) == 0) { target = maps[i].target; break; }
             }
             if (!target) goto done;
-            if (count >= max_sheets) goto done;
+            if (count == path_cap) {
+                int nc = path_cap ? path_cap * 2 : 16;
+                char (*np)[256] = (char (*)[256])realloc(paths, sizeof(*paths) * (size_t)nc);
+                if (!np) goto done;
+                paths = np;
+                path_cap = nc;
+            }
             dc_normalize_part_path(target, paths[count], 256);
             if (!dc_zip_find(z, paths[count])) goto done;
             count++;
             p = te;
         }
         if (count == 0) goto done;
+        *out_paths = paths;
         *out_count = count;
+        paths = NULL;
         rc = 0;
     }
 
 done:
+    free(maps);
+    dc_free_paths(paths);
     free(wb);
     free(rel);
     return rc;
@@ -1348,9 +1391,11 @@ static void dc_format_sheet_number(double val, char* buf, size_t buf_size) {
 }
 
 // 处理一个工作表 XML：逐单元格清洗，仅替换发生变化的单元格
+// 含公式（<f>）的单元格整格原样保留、不参与清洗：其值由公式决定，
+// 改写只会删掉公式。*has_formula 置 1 表示本表存在公式单元格。
 // 0 成功（*out_xml 为 malloc 的新 XML）/ DC_ZIP_UNSUPPORTED 不支持
 static int dc_process_sheet_xml(const char* xml, char** shared, int shared_count,
-                                const CellContext* ctx, int* formulas_changed,
+                                const CellContext* ctx, int* has_formula,
                                 char** out_xml) {
     DcBuf out = { 0, 0, 0 };
     const char* xml_end = xml + strlen(xml);
@@ -1409,6 +1454,14 @@ static int dc_process_sheet_xml(const char* xml, char** shared, int shared_count
         int has_f = 0;
         for (const char* q = inner; q < inner_end; q++) {
             if (dc_tag_at(q, "<f")) { has_f = 1; break; }
+        }
+        if (has_f) {
+            // 公式单元格：整格原样保留（公式、缓存值、样式都不动）
+            if (dc_buf_put(&out, cand, (size_t)(cell_end - cand)) != 0) goto unsupported;
+            ctx->stats->formula_cells++;
+            *has_formula = 1;
+            cur = cell_end;
+            continue;
         }
 
         // 取当前值（字符串形式，与重建路径经 xlsxio 读到的口径一致）
@@ -1475,6 +1528,13 @@ static int dc_process_sheet_xml(const char* xml, char** shared, int shared_count
         if (is_num) {
             char numbuf[64];
             dc_format_sheet_number(num_val, numbuf, sizeof(numbuf));
+            if (strcmp(tbuf, "n") == 0 && strcmp(numbuf, value) == 0) {
+                // 数值且结果与原值一致：整格原样保留，不做无意义的重写
+                if (dc_buf_put(&out, cand, (size_t)(cell_end - cand)) != 0) { free(owned); goto unsupported; }
+                free(owned);
+                cur = cell_end;
+                continue;
+            }
             // <c r=".." [s=".."]><v>num</v></c>
             if (dc_buf_puts(&out, "<c ") != 0 ||
                 dc_buf_put(&out, a_r->ns, (size_t)(a_r->ae - a_r->ns)) != 0) { free(owned); goto unsupported; }
@@ -1484,12 +1544,10 @@ static int dc_process_sheet_xml(const char* xml, char** shared, int shared_count
             }
             if (dc_buf_puts(&out, "><v>") != 0 || dc_buf_puts(&out, numbuf) != 0 ||
                 dc_buf_puts(&out, "</v></c>") != 0) { free(owned); goto unsupported; }
-            if (has_f) *formulas_changed = 1;
         } else if (strcmp(cleaned, value) == 0) {
-            // 未变化：整格原样保留（公式、样式、合并关系都不动）
+            // 未变化：整格原样保留（样式、合并关系都不动）
             if (dc_buf_put(&out, cand, (size_t)(cell_end - cand)) != 0) { free(owned); goto unsupported; }
         } else {
-            if (has_f) *formulas_changed = 1;
             if (cleaned[0] == '\0') {
                 // 清洗后为空：保留坐标与样式的空单元格
                 if (dc_buf_puts(&out, "<c ") != 0 ||
@@ -1535,26 +1593,60 @@ unsupported:
 }
 
 
-// 删除 XML 中提到 needle 的元素（如 calcChain 的 Override / Relationship 条目），malloc 结果
-static char* dc_remove_elem_mentioning(const char* xml, const char* elem, const char* needle) {
-    const char* np = strstr(xml, needle);
-    if (!np) return NULL;
-    const char* start = NULL;
-    for (const char* q = xml; q < np; q++) {
-        if (*q == '<' && dc_tag_at(q, elem)) start = q;
-    }
-    if (!start) return NULL;
-    const char* close = strstr(np, "/>");
-    if (!close) return NULL;
-    const char* after = close + 2;
+// 公式单元格本身不改，但它们引用的单元格可能被清洗改写，缓存值随之过期。
+// 在 workbook.xml 的 <calcPr> 上设置 fullCalcOnLoad="1"，让 Excel 打开时全量重算。
+// 返回 malloc 的新 XML；无需修改 / 找不到安全插入点时返回 NULL（不视为错误）。
+static char* dc_set_full_calc_on_load(const char* wb) {
+    const char* end = wb + strlen(wb);
     DcBuf b = { 0, 0, 0 };
-    if (dc_buf_put(&b, xml, (size_t)(start - xml)) != 0 ||
-        dc_buf_put(&b, after, strlen(after)) != 0 ||
-        dc_buf_put(&b, "", 1) != 0) {
-        dc_buf_free(&b);
-        return NULL;
+
+    // 已有 <calcPr>：补上 / 改写 fullCalcOnLoad 属性
+    for (const char* p = strstr(wb, "<calcPr"); p; p = strstr(p + 7, "<calcPr")) {
+        if (!dc_tag_at(p, "<calcPr")) continue;
+        int sc = 0;
+        const char* te = dc_find_tag_end(p, end, &sc);
+        if (!te) return NULL;
+        DcAttr attrs[24];
+        int na = dc_tag_attrs(p, te, attrs, 24);
+        if (na < 0) return NULL;
+        const DcAttr* a = dc_attr_find(attrs, na, "fullCalcOnLoad");
+        if (a) {
+            size_t vl = (size_t)(a->ve - a->vs);
+            if ((vl == 1 && a->vs[0] == '1') || (vl == 4 && strncmp(a->vs, "true", 4) == 0)) return NULL;
+            if (dc_buf_put(&b, wb, (size_t)(a->vs - wb)) != 0 || dc_buf_puts(&b, "1") != 0 ||
+                dc_buf_put(&b, a->ve, strlen(a->ve) + 1) != 0) { dc_buf_free(&b); return NULL; }
+        } else {
+            const char* ins = p + 7; // "<calcPr" 之后
+            if (dc_buf_put(&b, wb, (size_t)(ins - wb)) != 0 || dc_buf_puts(&b, " fullCalcOnLoad=\"1\"") != 0 ||
+                dc_buf_put(&b, ins, strlen(ins) + 1) != 0) { dc_buf_free(&b); return NULL; }
+        }
+        return (char*)b.d;
     }
-    return (char*)b.d;
+
+    // 没有 <calcPr>：按 schema 顺序（sheets, functionGroups, externalReferences, definedNames, calcPr）
+    // 插到其中最靠后的已有元素之后
+    static const char* const anchors[] = { "definedNames", "externalReferences", "functionGroups", "sheets" };
+    for (size_t k = 0; k < sizeof(anchors) / sizeof(anchors[0]); k++) {
+        char open[32], close[40];
+        snprintf(open, sizeof(open), "<%s", anchors[k]);
+        snprintf(close, sizeof(close), "</%s>", anchors[k]);
+        const char* p = strstr(wb, open);
+        while (p && !dc_tag_at(p, open)) p = strstr(p + 1, open);
+        if (!p) continue;
+        int sc = 0;
+        const char* te = dc_find_tag_end(p, end, &sc);
+        if (!te) return NULL;
+        const char* after = te;
+        if (!sc) {
+            const char* c = strstr(te, close);
+            if (!c) return NULL;
+            after = c + strlen(close);
+        }
+        if (dc_buf_put(&b, wb, (size_t)(after - wb)) != 0 || dc_buf_puts(&b, "<calcPr fullCalcOnLoad=\"1\"/>") != 0 ||
+            dc_buf_put(&b, after, strlen(after) + 1) != 0) { dc_buf_free(&b); return NULL; }
+        return (char*)b.d;
+    }
+    return NULL;
 }
 
 static void dc_merge_stats(CleanStats* dst, const CleanStats* src) {
@@ -1563,17 +1655,23 @@ static void dc_merge_stats(CleanStats* dst, const CleanStats* src) {
     dst->kept_cells += src->kept_cells;
     dst->numbers_found += src->numbers_found;
     dst->dates_normalized += src->dates_normalized;
+    dst->formula_cells += src->formula_cells;
 }
 
 // XLSX 原位处理主流程：统计先记本地账，成功/取消时才并入，
 // 保证回退到重建路径时不会重复计数。
-// 返回 0 成功 / 1 打开失败 / 2 已取消 / DC_ZIP_UNSUPPORTED 结构不支持（回退）
+// 返回 0 成功 / 1 失败（打开或写出失败，不回退）/ 2 已取消 /
+//      DC_ZIP_UNSUPPORTED 结构不支持（*why 给出原因，调用方回退兼容模式）
 static int process_xlsx_inplace(const wchar_t* in_path, const wchar_t* out_path,
                                 const CleanOptions* opts, ProgressCallback cb, void* user,
-                                CleanStats* stats) {
+                                CleanStats* stats, const wchar_t** why) {
+    *why = L"未知原因";
     DcZip z;
-    int lrc = dc_zip_load(in_path, &z);
-    if (lrc == 1) return 1;
+    int lrc = dc_zip_load(in_path, &z, why);
+    if (lrc == 1) {
+        if (cb) cb(user, 0, L"错误：无法读取输入 Excel 文件（文件被占用或内存不足？）");
+        return 1;
+    }
     if (lrc != 0) return DC_ZIP_UNSUPPORTED;
 
     if (cb) cb(user, 5, L"正在打开 Excel 文件...");
@@ -1581,25 +1679,29 @@ static int process_xlsx_inplace(const wchar_t* in_path, const wchar_t* out_path,
     int rc = DC_ZIP_UNSUPPORTED;
     char** shared = NULL;
     int shared_count = 0;
-    char sheet_paths[MAX_SHEETS][256];
+    char (*sheet_paths)[256] = NULL;
     int sheet_count = 0;
     CleanStats local;
     memset(&local, 0, sizeof(local));
     CellContext ctx = { opts, &local };
-    int formulas_changed = 0;
+    int has_formula = 0;
+    int any_changed = 0;
     int cancelled = 0;
 
     // sharedStrings.xml 是可选部件
     DcZipEntry* ss = dc_zip_find(&z, "xl/sharedStrings.xml");
     if (ss) {
         unsigned char* ss_xml = dc_zip_read(&z, ss, NULL);
-        if (!ss_xml) goto done;
+        if (!ss_xml) { *why = L"共享字符串表压缩方式不支持或已损坏"; goto done; }
         shared = dc_parse_shared_strings((const char*)ss_xml, &shared_count);
         free(ss_xml);
-        if (!shared) goto done;
+        if (!shared) { *why = L"共享字符串表无法解析"; goto done; }
     }
 
-    if (dc_parse_sheets(&z, sheet_paths, MAX_SHEETS, &sheet_count) != 0) goto done;
+    if (dc_parse_sheets(&z, &sheet_paths, &sheet_count) != 0) {
+        *why = L"工作簿 / 工作表关系结构无法识别";
+        goto done;
+    }
 
     for (int i = 0; i < sheet_count; i++) {
         if (g_cancel_requested) { cancelled = 1; break; }
@@ -1610,18 +1712,23 @@ static int process_xlsx_inplace(const wchar_t* in_path, const wchar_t* out_path,
         if (cb) cb(user, pct, status_buf);
 
         DcZipEntry* se = dc_zip_find(&z, sheet_paths[i]);
-        if (!se) goto done;
+        if (!se) { *why = L"工作表部件缺失"; goto done; }
         unsigned char* sheet_raw = dc_zip_read(&z, se, NULL);
-        if (!sheet_raw) goto done;
+        if (!sheet_raw) { *why = L"工作表压缩方式不支持或已损坏"; goto done; }
         char* new_xml = NULL;
         int prc = dc_process_sheet_xml((const char*)sheet_raw, shared, shared_count,
-                                       &ctx, &formulas_changed, &new_xml);
-        if (prc != 0) { free(sheet_raw); goto done; }
+                                       &ctx, &has_formula, &new_xml);
+        if (prc != 0) {
+            free(sheet_raw);
+            *why = L"工作表中存在无法安全改写的单元格结构";
+            goto done;
+        }
         if (strcmp(new_xml, (const char*)sheet_raw) == 0) {
             free(new_xml); // 整表无变化：条目原样复制，字节级保留
         } else {
             se->new_data = (unsigned char*)new_xml;
             se->new_len = strlen(new_xml);
+            any_changed = 1;
         }
         free(sheet_raw);
     }
@@ -1633,61 +1740,59 @@ static int process_xlsx_inplace(const wchar_t* in_path, const wchar_t* out_path,
         goto done;
     }
 
-    // 有公式单元格被改写：其缓存值已失效，摘除 calcChain 让 Excel 打开时重算
-    if (formulas_changed) {
-        DcZipEntry* cc = dc_zip_find(&z, "xl/calcChain.xml");
-        if (cc) {
-            cc->drop = 1;
-            DcZipEntry* ct = dc_zip_find(&z, "[Content_Types].xml");
-            if (ct && !ct->new_data) {
-                unsigned char* ct_xml = dc_zip_read(&z, ct, NULL);
-                if (ct_xml) {
-                    char* patched = dc_remove_elem_mentioning((const char*)ct_xml, "<Override", "calcChain.xml");
-                    free(ct_xml);
-                    if (patched) {
-                        ct->new_data = (unsigned char*)patched;
-                        ct->new_len = strlen(patched);
-                    }
-                }
-            }
-            DcZipEntry* wr = dc_zip_find(&z, "xl/_rels/workbook.xml.rels");
-            if (wr && !wr->new_data) {
-                unsigned char* wr_xml = dc_zip_read(&z, wr, NULL);
-                if (wr_xml) {
-                    char* patched = dc_remove_elem_mentioning((const char*)wr_xml, "<Relationship", "calcChain.xml");
-                    free(wr_xml);
-                    if (patched) {
-                        wr->new_data = (unsigned char*)patched;
-                        wr->new_len = strlen(patched);
-                    }
-                }
-            }
+    // 公式单元格原样保留，但其引用的单元格可能已被改写：要求 Excel 打开时全量重算
+    if (has_formula && any_changed) {
+        DcZipEntry* wbe = dc_zip_find(&z, "xl/workbook.xml");
+        unsigned char* wb_xml = wbe ? dc_zip_read(&z, wbe, NULL) : NULL;
+        char* patched = wb_xml ? dc_set_full_calc_on_load((const char*)wb_xml) : NULL;
+        free(wb_xml);
+        if (patched) {
+            wbe->new_data = (unsigned char*)patched;
+            wbe->new_len = strlen(patched);
+        } else if (cb) {
+            cb(user, 10, L"⚠ 提示：未能设置“打开时重算”，公式结果可能需要在 Excel 中按 F9 手动刷新。");
         }
     }
 
     if (cb) cb(user, 95, L"正在保存并关闭 Excel 文件...");
     if (dc_zip_write(&z, out_path) != 0) {
+        // 写出失败是 I/O 问题而非结构问题：报失败，绝不换成有损的兼容模式去“重试”
         DeleteFileW(out_path);
-        rc = DC_ZIP_UNSUPPORTED; // 写出异常时回退重建路径重试
+        if (cb) cb(user, 0, L"错误：写出输出 Excel 文件失败（磁盘空间不足或无写入权限？）");
+        rc = 1;
         goto done;
     }
 
     dc_merge_stats(stats, &local);
+    if (local.formula_cells > 0 && cb) {
+        wchar_t fbuf[160];
+        swprintf(fbuf, 160, L"已原样保留 %lld 个公式单元格（不参与清洗）。", local.formula_cells);
+        cb(user, 98, fbuf);
+    }
     if (cb) cb(user, 100, L"文件处理完成。");
     rc = 0;
 
 done:
+    dc_free_paths(sheet_paths);
     dc_free_shared(shared, shared_count);
     dc_zip_free(&z);
     return rc;
 }
 
-// XLSX 入口：优先原位改值（保留样式/公式/合并单元格），结构不支持时回退原重建路径
+// XLSX 入口：优先原位改值（保留样式/公式/合并单元格）；结构不支持时回退兼容模式重建，
+// 并明确告知用户原因与后果（*degraded 置 1），不再静默降级。
 static int process_xlsx(const wchar_t* in_path, const wchar_t* out_path,
                         const CleanOptions* opts, ProgressCallback cb, void* user,
-                        CleanStats* stats) {
-    int rc = process_xlsx_inplace(in_path, out_path, opts, cb, user, stats);
+                        CleanStats* stats, int* degraded) {
+    const wchar_t* why = NULL;
+    *degraded = 0;
+    int rc = process_xlsx_inplace(in_path, out_path, opts, cb, user, stats, &why);
     if (rc == DC_ZIP_UNSUPPORTED) {
+        wchar_t msg[320];
+        swprintf(msg, 320, L"⚠ 原位模式不支持该文件（%ls），改用兼容模式重建：单元格样式、公式、合并单元格等将丢失！",
+                 why ? why : L"未知原因");
+        if (cb) cb(user, 5, msg);
+        *degraded = 1;
         rc = process_xlsx_rebuild(in_path, out_path, opts, cb, user, stats);
     }
     return rc;
@@ -1970,8 +2075,10 @@ static int process_csv(const wchar_t* in_path, const wchar_t* out_path,
     buf_free(&field);
     free(content);
 
-    if (fclose(out) != 0) {
-        if (cancelled) DeleteFileW(out_path);
+    int write_err = ferror(out);
+    if (fclose(out) != 0 || write_err) {
+        DeleteFileW(out_path);
+        if (!cancelled && cb) cb(user, 0, L"错误：写出输出 CSV 文件失败（磁盘空间不足或无写入权限？）");
         return 1;
     }
 
@@ -2039,16 +2146,33 @@ int run_clean_jobs(FileJob* jobs, int job_count, const CleanOptions* opts,
 
         make_output_path(jobs[i].input, jobs[i].output);
 
+        // 原子写出：先写同目录临时文件，成功后再替换为正式输出；
+        // 失败 / 取消 / 进程被杀时都不会留下名字合法、内容截断的 _Cleaned 文件
+        wchar_t tmp_path[DC_PATH + 16];
+        swprintf(tmp_path, DC_PATH + 16, L"%ls.dctmp", jobs[i].output);
+
         memset(&jobs[i].stats, 0, sizeof(CleanStats));
+        jobs[i].degraded = 0;
         MappedCb mapped = { cb, user, base, span };
 
         int res;
         const wchar_t* ext = wcsrchr(jobs[i].input, L'.');
         if (ext && _wcsicmp(ext, L".csv") == 0) {
-            res = process_csv(jobs[i].input, jobs[i].output, opts, MappedProgress, &mapped, &jobs[i].stats);
+            res = process_csv(jobs[i].input, tmp_path, opts, MappedProgress, &mapped, &jobs[i].stats);
         } else {
-            res = process_xlsx(jobs[i].input, jobs[i].output, opts, MappedProgress, &mapped, &jobs[i].stats);
+            res = process_xlsx(jobs[i].input, tmp_path, opts, MappedProgress, &mapped, &jobs[i].stats,
+                               &jobs[i].degraded);
         }
+        if (res == 0) {
+            if (!MoveFileExW(tmp_path, jobs[i].output, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                wchar_t emsg[160];
+                swprintf(emsg, 160, L"错误：无法生成最终输出文件（错误码 %lu，目标文件可能正被 Excel 打开）",
+                         (unsigned long)GetLastError());
+                if (cb) cb(user, base + span, emsg);
+                res = 1;
+            }
+        }
+        if (res != 0) DeleteFileW(tmp_path);
         jobs[i].result = res;
 
         total.total_cells += jobs[i].stats.total_cells;
@@ -2056,12 +2180,14 @@ int run_clean_jobs(FileJob* jobs, int job_count, const CleanOptions* opts,
         total.kept_cells += jobs[i].stats.kept_cells;
         total.numbers_found += jobs[i].stats.numbers_found;
         total.dates_normalized += jobs[i].stats.dates_normalized;
+        total.formula_cells += jobs[i].stats.formula_cells;
 
         wchar_t msg[DC_PATH + 160];
         const wchar_t* fn2 = wcsrchr(jobs[i].input, L'\\');
         fn2 = fn2 ? fn2 + 1 : jobs[i].input;
         if (res == 0) {
-            swprintf(msg, DC_PATH + 160, L"✅ 完成：%s（修改 %lld / %lld 个单元格）",
+            swprintf(msg, DC_PATH + 160, L"✅ 完成%ls：%s（修改 %lld / %lld 个单元格）",
+                     jobs[i].degraded ? L"（兼容模式，格式/公式已丢失）" : L"",
                      fn2, jobs[i].stats.modified_cells, jobs[i].stats.total_cells);
         } else if (res == 2) {
             swprintf(msg, DC_PATH + 160, L"⏹ 已取消：%s", fn2);

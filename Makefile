@@ -33,7 +33,19 @@ excel_cleaner.o: excel_cleaner.c excel_cleaner.h
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) -static-libgcc $(STATIC_LIBS) $(SYS_LIBS)
 
-clean:
-	rm -f *.o $(TARGET)
+# ---- 测试 ----
+# 控制台程序（不带 -mwindows），直接包含引擎源码以覆盖 static 函数
+TEST_CFLAGS = -O1 -g -Wall -DBUILD_XLSXIO_STATIC
+TEST_TARGET = tests/test_p0.exe
 
-.PHONY: all clean
+$(TEST_TARGET): tests/test_p0.c excel_cleaner.c excel_cleaner.h
+	$(CC) $(TEST_CFLAGS) tests/test_p0.c -o $(TEST_TARGET) $(STATIC_LIBS) \
+	      -lcomctl32 -lshlwapi -lshell32 -lole32 -ladvapi32 -lbcrypt
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
+
+clean:
+	rm -f *.o $(TARGET) $(TEST_TARGET)
+
+.PHONY: all clean test
